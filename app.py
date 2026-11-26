@@ -1,132 +1,173 @@
-from pathlib import Path
-import json
+import io
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from modelo import encuesta, calcular, DEFAULT, SECTORES
 
-st.set_page_config(page_title='AeroEntrega | Diseño de Máquinas',page_icon='🚁',layout='wide')
-st.markdown('''<style>.stApp{background:#f6f8fc} h1,h2,h3{color:#102c50} div[data-testid="stMetric"]{background:white;padding:18px;border-radius:12px;border:1px solid #dce5ef}</style>''',unsafe_allow_html=True)
-st.title('AeroEntrega · del mercado al diseño')
-st.caption('Laboratorio de Diseño de Máquinas · drones de reparto · horizonte de 48 meses · USD')
-st.warning('CASO FICTICIO. Encuesta sintética y supuestos didácticos; no representa demanda real ni una autorización de vuelo.')
-if 'base' not in st.session_state: st.session_state.base=encuesta()
-p=DEFAULT.copy()
+from datos import cargar, frecuencias, porcentaje, TITULOS, ORDEN
+import qfd
+
+VERDE, FUEGO, SUELO, TINTA = "#2F6B4F", "#C2410C", "#E6EBDF", "#1D2B24"
+SECUENCIA = ["#C2410C", "#E8883A", "#C9CFC6", "#7DB59A", "#2F6B4F"]  # de menos a más (divergente)
+
+st.set_page_config(page_title="Riego inteligente y prevención de incendios", page_icon="🔥", layout="wide")
+st.markdown(f"""
+<style>
+html, body, [class*="css"] {{ font-family: "Source Sans 3", "Segoe UI", sans-serif; }}
+h1, h2, h3 {{ font-family: "Archivo Narrow", "Arial Narrow", Arial, sans-serif; color:{TINTA}; letter-spacing:-.01em; }}
+.block-container {{ padding-top: 2rem; max-width: 1180px; }}
+div[data-testid="stMetric"] {{ background:#fff; border:1px solid #C9CFC6; border-left:5px solid {VERDE};
+  padding:14px 16px; border-radius:6px; }}
+div[data-testid="stMetric"] label {{ color:#5D6B64; }}
+button[data-baseweb="tab"] {{ font-weight:600; }}
+.nota {{ color:#5D6B64; font-size:.9rem; max-width:75ch; }}
+.hallazgo {{ background:#fff; border:1px solid #C9CFC6; border-left:5px solid {FUEGO}; padding:12px 16px;
+  border-radius:6px; margin:6px 0; max-width:80ch; }}
+</style>""", unsafe_allow_html=True)
+
+
+def estilo(fig, alto=380):
+    fig.update_layout(height=alto, margin=dict(l=8, r=8, t=48, b=8), paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(0,0,0,0)", font=dict(color=TINTA), title_font_size=16,
+                      legend_title_text="")
+    fig.update_xaxes(gridcolor="#DDE2D8"); fig.update_yaxes(gridcolor="#DDE2D8")
+    return fig
+
+
+def barras(df, campo, color=VERDE, secuencia=False):
+    t = frecuencias(df, campo)
+    t["Etiqueta"] = t["Respuesta"].astype(str).str.wrap(38).str.replace("\n", "<br>")
+    t = t.iloc[::-1] if campo not in ORDEN else t.iloc[::-1]
+    fig = px.bar(t, x="Porcentaje", y="Etiqueta", orientation="h", text=t["Porcentaje"].map("{:.0f} %".format),
+                 title=TITULOS[campo], hover_data={"Personas": True, "Etiqueta": False})
+    fig.update_traces(marker_color=color, textposition="outside", cliponaxis=False)
+    fig.update_yaxes(title=""); fig.update_xaxes(title="% de quienes respondieron", range=[0, t["Porcentaje"].max() * 1.2])
+    return estilo(fig, 120 + 52 * len(t))
+
+
+# ---------- datos ----------
 with st.sidebar:
-    st.header('Simulador de negocio')
-    escenario=st.selectbox('Escenario',['Base','Conservador','Optimista'])
-    p['empresas']=st.number_input('Empresas en mercado objetivo',1,100000,1500)
-    p['conversion']=st.slider('Conversión de intención a compra',0.,1.,.6,.05)
-    p['precio']=st.number_input('Precio por dron (USD)',100,50000,6000,100)
-    p['variable']=st.number_input('Costo variable por dron (USD)',0,50000,3400,100)
-    p['fijo']=st.number_input('Costos fijos mensuales (USD)',0,100000,9000,500)
-    p['inversion']=st.number_input('Inversión inicial total (USD)',0,5000000,180000,10000)
-    p['activo']=st.number_input('Activos depreciables incluidos (USD)',0,p['inversion'],min(120000,p['inversion']),1000)
-    p['capacidad']=st.number_input('Capacidad de fabricación (drones/mes)',0,1000,25)
-    p['inflacion']=st.slider('Crecimiento anual de costos',0.,.3,.03,.01)
-    p['precio_var']=st.slider('Variación anual del precio',-.3,.3,-.02,.01)
-    p['descuento']=st.slider('Tasa de descuento anual',0.,.5,.12,.01)
-    st.subheader('Ciclo de vida: meses')
-    p['lanzamiento']=st.slider('Salida al mercado',2,12,7)
-    p['madurez']=st.slider('Inicio de maduración',p['lanzamiento']+1,28,22)
-    p['saturacion']=st.slider('Inicio de saturación',p['madurez']+1,38,32)
-    p['declive']=st.slider('Inicio de declive',p['saturacion']+1,47,39)
-    p['cola']=st.slider('Ventas relativas al final',0.,1.,.25,.05)
-    if escenario=='Conservador': p['conversion']*=.7; p['variable']*=1.15
-    if escenario=='Optimista': p['conversion']=min(1,p['conversion']*1.25); p['variable']*=.9
-pmodelo=p.copy()
-tabla,k=calcular(st.session_state.base,pmodelo)
-# Etiquetas independientes de los nodos de ventas.
-m=tabla.Mes
-tabla['Etapa']=np.select([m<p['lanzamiento'],m<p['madurez'],m<p['saturacion'],m<p['declive']],['Desarrollo','Introducción / crecimiento','Maduración','Saturación'],default='Declive')
-cols=st.columns(4)
-for col,label,value in zip(cols,['Drones vendidos · 4 años','Ingresos · USD','VAN · USD','Recuperación simple'],[f'{tabla.Ventas.sum():,}',f'{tabla.Ingresos.sum():,.0f}',f'{k["van"]:,.0f}',f'Mes {k["payback"]}' if k['payback'] else 'No recupera en 48 meses']): col.metric(label,value)
-tabs=st.tabs(['1 · Encuesta','2 · Mercado','3 · Demanda y ciclo','4 · Costos y ganancias','5 · Sensibilidad','6 · Diseño y clase'])
+    st.header("Datos")
+    subido = st.file_uploader("Actualizar con un Excel nuevo", type=["xlsx"],
+                              help="Mismo formato de Google Forms: 11 columnas, la primera es la marca temporal.")
+    st.caption("Sin archivo, se usa encuesta_respuestas.xlsx del repositorio.")
+
+try:
+    df = cargar(subido)
+except Exception as e:
+    st.error(f"No se pudo leer el Excel: {e}")
+    st.stop()
+
+n = len(df)
+st.title("Riego inteligente con detección de incendios")
+st.caption(f"Encuesta a {n} personas · {df.marca.min():%d/%m/%Y} al {df.marca.max():%d/%m/%Y} · Proyecto de Diseño de Máquinas")
+
+alta = porcentaje(df, "preocupa", ORDEN["preocupa"][3:])
+ambas = porcentaje(df, "funcion", "Ambas funciones por igual")
+piloto = porcentaje(df, "piloto", ORDEN["piloto"][3:])
+vio_seco = porcentaje(df, "seco", ORDEN["seco"][2:])
+c = st.columns(4)
+c[0].metric("Respuestas", n)
+c[1].metric("Preocupación alta por incendios", f"{alta:.0f} %", help="Respondieron 4 o 5 en la escala de 1 a 5")
+c[2].metric("Quieren ambas funciones", f"{ambas:.0f} %")
+c[3].metric("Apoyan una prueba piloto", f"{piloto:.0f} %", help="«Probablemente sí» o «Sí, definitivamente»")
+
+tabs = st.tabs(["Resumen", "Resultados", "Cruces", "Casa de la calidad", "Datos", "Método"])
+
+# ---------- Resumen ----------
 with tabs[0]:
-    st.subheader('Encuesta empresarial ficticia')
-    st.write('Producto: compra de un dron de reparto, con capacitación inicial. Seleccione una empresa hipotética y complete el formulario; sus respuestas se incorporan al análisis.')
-    with st.form('encuesta'):
-        a,b=st.columns(2)
-        sector=a.selectbox('1. Sector de la empresa',SECTORES)
-        entregas=a.number_input('2. Entregas diarias',1,10000,50)
-        distancia=a.number_input('3. Radio de servicio requerido (km)',1,500,10)
-        carga=a.number_input('4. Carga útil requerida (kg)',.1,100.,3.)
-        autonomia=a.number_input('5. Autonomía mínima (min)',1,300,30)
-        intencion=b.selectbox('6. ¿Compraría drones de reparto?',['Sí','Tal vez','No'])
-        unidades=b.number_input('7. Unidades que adquiriría en cuatro años',1,1000,2)
-        presupuesto=b.number_input('8. Presupuesto máximo por dron (USD)',0,100000,6000)
-        prioridad=b.selectbox('9. Principal criterio de compra',['Autonomía','Seguridad','Precio','Carga útil','Mantenimiento'])
-        barrera=b.selectbox('10. Principal barrera',['Costo','Regulación','Seguridad','Infraestructura','Aceptación'])
-        if st.form_submit_button('Añadir respuesta ficticia'):
-            fila=dict(empresa=f'Respuesta de clase {len(st.session_state.base)+1}',sector=sector,entregas_dia=entregas,distancia_km=distancia,carga_kg=carga,autonomia_min=autonomia,intencion=intencion,unidades=unidades,presupuesto_usd=presupuesto,prioridad=prioridad,barrera=barrera)
-            st.session_state.base=pd.concat([st.session_state.base,pd.DataFrame([fila])],ignore_index=True)
-            st.rerun()
-    st.info('Respuestas de clase conservadas solo durante esta sesión. Descargue el CSV para guardarlas.')
-    if st.button('Restablecer las 120 empresas simuladas'): st.session_state.base=encuesta(); st.rerun()
-    st.dataframe(st.session_state.base,hide_index=True)
-    st.download_button('Descargar encuesta CSV',st.session_state.base.to_csv(index=False).encode('utf-8-sig'),'encuesta_ficticia.csv','text/csv')
+    top_problema = frecuencias(df, "problema").sort_values("Porcentaje", ascending=False).iloc[0]
+    top_barrera = frecuencias(df[~df.barrera.isin(["No estoy seguro/a", "No tendría preocupaciones importantes"])],
+                              "barrera").sort_values("Porcentaje", ascending=False).iloc[0]
+    st.subheader("Lo que dicen los datos")
+    for txt in [
+        f"<b>{alta:.0f} %</b> siente preocupación alta (4 o 5) por incendios en vegetación seca; el promedio es <b>{df.preocupa_n.mean():.1f} de 5</b>.",
+        f"<b>{ambas:.0f} %</b> prefiere que el sistema haga ambas cosas, detectar incendios y regar, antes que solo una de las dos.",
+        f"El problema que más personas quieren atender es «{top_problema.Respuesta.lower()}» ({top_problema.Porcentaje:.0f} %), seguido muy de cerca por los demás.",
+        f"La mayor barrera para instalarlo es el <b>{top_barrera.Respuesta.lower()}</b> ({top_barrera.Porcentaje:.0f} % del total de respuestas).",
+        f"<b>{piloto:.0f} %</b> apoyaría una prueba piloto en la universidad; solo {porcentaje(df, 'piloto', ORDEN['piloto'][:2]):.0f} % está en contra.",
+    ]:
+        st.markdown(f'<div class="hallazgo">{txt}</div>', unsafe_allow_html=True)
+    a, b = st.columns(2)
+    a.plotly_chart(barras(df, "funcion", FUEGO), width="stretch")
+    b.plotly_chart(barras(df, "piloto", VERDE), width="stretch")
+
+# ---------- Resultados ----------
 with tabs[1]:
-    df=st.session_state.base
-    a,b=st.columns(2)
-    a.plotly_chart(px.histogram(df,x='sector',color='intencion',barmode='group',title='Intención por sector'),width='stretch')
-    b.plotly_chart(px.histogram(df,x='presupuesto_usd',title='Presupuesto máximo por dron'),width='stretch')
-    st.dataframe(df.groupby('sector').agg(empresas=('empresa','count'),entregas_dia=('entregas_dia','mean'),carga_kg=('carga_kg','median'),autonomia_min=('autonomia_min','median'),presupuesto=('presupuesto_usd','median')),width='stretch')
-    st.write(f'Potencial estimado del horizonte: {k["potencial"]:,.1f} drones, antes de capacidad. Es una extrapolación docente de una muestra sintética.')
+    st.caption("Cada gráfico usa solo a quienes contestaron esa pregunta; por eso los totales pueden variar en una o dos personas.")
+    for campo in ["visita", "seco", "lugar", "problema", "metodo", "dificultad", "preocupa", "funcion", "barrera", "piloto"]:
+        color = FUEGO if campo in ("preocupa", "problema", "funcion") else VERDE
+        st.plotly_chart(barras(df, campo, color), width="stretch", key=f"b_{campo}")
+
+# ---------- Cruces ----------
 with tabs[2]:
-    st.plotly_chart(px.line(tabla,x='Mes',y=['Demanda','Ventas'],title='Demanda de compra y ventas limitadas por fabricación'),width='stretch')
-    st.dataframe(tabla.groupby(['Año','Etapa'],sort=False)[['Demanda','Ventas','Demanda no atendida']].sum().reset_index(),hide_index=True)
-    anual=tabla.groupby('Año')[['Demanda','Ventas','Demanda no atendida','Ingresos','Costo variable','Costo fijo','EBITDA','Utilidad operativa','Flujo neto']].sum()
-    st.subheader('Proyección a cuatro años'); st.dataframe(anual.style.format('{:,.0f}'))
-    st.caption('La curva corresponde a ventas mensuales, no a adopción acumulada. El ciclo completo se comprime a cuatro años para el ejercicio; las unidades no atendidas se pierden, sin cartera pendiente ni reemplazos.')
+    st.subheader("Preocupación por incendios y función preferida")
+    d = df.dropna(subset=["preocupa", "funcion"])
+    m = pd.crosstab(d["funcion"], d["preocupa"], normalize="index").mul(100).round(0)
+    fig = px.imshow(m, text_auto=".0f", aspect="auto", color_continuous_scale=["#F6F4EC", "#E8883A", "#C2410C"],
+                    labels=dict(color="% de la fila"), title="% dentro de cada función preferida")
+    fig.update_xaxes(title="Preocupación por incendios", side="bottom"); fig.update_yaxes(title="")
+    st.plotly_chart(estilo(fig, 360), width="stretch")
+    st.markdown('<p class="nota">Cada fila suma 100 %. Con pocas personas en algunas filas, léelo como tendencia y no como prueba.</p>', unsafe_allow_html=True)
+
+    st.subheader("Apoyo a la prueba piloto según lo observado")
+    d = df.dropna(subset=["seco", "piloto"])
+    m = pd.crosstab(d["seco"], d["piloto"]).reindex(index=ORDEN["seco"], columns=ORDEN["piloto"], fill_value=0)
+    pct = m.div(m.sum(axis=1).replace(0, np.nan), axis=0).mul(100)
+    fig = go.Figure()
+    for col, color in zip(ORDEN["piloto"], SECUENCIA):
+        fig.add_bar(y=pct.index, x=pct[col], name=col, orientation="h", marker_color=color)
+    fig.update_layout(barmode="stack", title="Frecuencia con que vio terrenos secos vs. apoyo al piloto")
+    fig.update_xaxes(title="% dentro de cada grupo", range=[0, 100]); fig.update_yaxes(title="", autorange="reversed")
+    st.plotly_chart(estilo(fig, 380), width="stretch")
+
+# ---------- Casa de la calidad ----------
 with tabs[3]:
-    st.plotly_chart(px.line(tabla,x='Mes',y=['Ingresos','Costo variable','Costo fijo','Utilidad operativa'],title='Resultados mensuales · USD'),width='stretch')
-    caja=pd.concat([pd.DataFrame({'Mes':[0],'Caja acumulada':[-p['inversion']]}),tabla[['Mes','Caja acumulada']]])
-    st.plotly_chart(px.line(caja,x='Mes',y='Caja acumulada',title='Caja acumulada, incluida inversión inicial'),width='stretch')
-    margen=p['precio']-p['variable']
-    st.write(f'Margen unitario inicial: USD {margen:,.0f}.')
-    st.write(f'Punto de equilibrio operativo inicial: {int(np.ceil(p["fijo"]/margen))} drones/mes.' if margen>0 else 'Sin punto de equilibrio: margen unitario no positivo.')
-    st.metric('Utilidad operativa total (sin impuestos)',f'USD {tabla["Utilidad operativa"].sum():,.0f}')
-    st.dataframe(tabla,hide_index=True)
-    st.download_button('Descargar resultados mensuales',tabla.to_csv(index=False).encode('utf-8-sig'),'resultados_48_meses.csv','text/csv')
-    st.download_button('Descargar supuestos',json.dumps(p,indent=2,ensure_ascii=False),'supuestos.json','application/json')
+    st.subheader("Casa de la calidad")
+    st.markdown('<p class="nota">La importancia de cada requisito se calcula con la encuesta: es proporcional al porcentaje de personas que lo respalda (de 1 a 5). Cambia las relaciones en la matriz (0, 1, 3 o 9) y la prioridad se recalcula.</p>', unsafe_allow_html=True)
+    imp = qfd.importancias(df)
+    tec = [t[0] for t in qfd.TECNICAS]
+    st.markdown("**Correlaciones entre características técnicas** (+ se apoyan, − se contraponen)")
+    st.markdown(qfd.techo_svg(), unsafe_allow_html=True)
+    mat = pd.DataFrame(qfd.RELACIONES, columns=tec, index=imp["Requisito"])
+    mat.insert(0, "Importancia", imp["Importancia"].values)
+    editada = st.data_editor(
+        mat, key="matriz", width="stretch",
+        disabled=["Importancia"],
+        column_config={"Importancia": st.column_config.NumberColumn(format="%.1f", help="Calculada con la encuesta"),
+                       **{t: st.column_config.SelectboxColumn(t, options=[0, 1, 3, 9], required=True) for t in tec}})
+    res = qfd.prioridades(editada["Importancia"].to_numpy(float), editada[tec].to_numpy(float))
+    st.dataframe(res, hide_index=True, width="stretch")
+    fig = px.bar(res.sort_values("Puntos"), x="Puntos", y="Característica técnica", orientation="h",
+                 text="Ranking", title="Prioridad técnica (el número es el ranking)")
+    fig.update_traces(marker_color=VERDE, texttemplate="%{text}°", textposition="outside", cliponaxis=False)
+    fig.update_yaxes(title="")
+    st.plotly_chart(estilo(fig, 420), width="stretch")
+    st.markdown('<p class="nota">Las metas son valores de partida para el diseño; confírmalas con tu docente y con las pruebas del prototipo.</p>', unsafe_allow_html=True)
+    with st.expander("De dónde sale la importancia"):
+        st.dataframe(imp, hide_index=True, width="stretch")
+
+# ---------- Datos ----------
 with tabs[4]:
-    filas=[]
-    for precio_factor in [.8,.9,1.,1.1,1.2]:
-        for conversion_factor in [.6,.8,1.,1.2,1.4]:
-            q=pmodelo.copy();q['precio']*=precio_factor;q['conversion']=min(1,q['conversion']*conversion_factor)
-            _,r=calcular(st.session_state.base,q)
-            filas.append({'Precio relativo':precio_factor,'Conversión relativa':conversion_factor,'VAN':r['van']})
-    sens=pd.DataFrame(filas)
-    st.plotly_chart(px.density_heatmap(sens,x='Precio relativo',y='Conversión relativa',z='VAN',histfunc='avg',text_auto='.0f',color_continuous_scale='RdYlGn',title='VAN ante precio y conversión'),width='stretch')
-    st.caption('La disposición de pago se vuelve a filtrar en cada precio; subir precio puede reducir compradores. Escenarios deterministas, sin probabilidades ni intervalos de confianza.')
-    st.dataframe(sens,hide_index=True)
+    vista = df.rename(columns={**TITULOS, "marca": "Marca temporal"}).drop(columns=["preocupa_n"])
+    st.dataframe(vista, hide_index=True, width="stretch")
+    buf = io.BytesIO(); vista.to_excel(buf, index=False)
+    a, b = st.columns(2)
+    a.download_button("Descargar CSV", vista.to_csv(index=False).encode("utf-8-sig"), "encuesta.csv", "text/csv")
+    b.download_button("Descargar Excel", buf.getvalue(), "encuesta.xlsx",
+                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ---------- Método ----------
 with tabs[5]:
-    st.subheader('Del requerimiento al concepto mecánico')
-    requisitos=pd.DataFrame([
-        ['Carga útil','Percentil 75 de encuesta',f'{df.carga_kg.quantile(.75):.1f} kg','Estructura, tren de aterrizaje, mecanismo de sujeción'],
-        ['Radio de servicio','Percentil 75',f'{df.distancia_km.quantile(.75):.1f} km','Energía de ida, retorno y reserva'],
-        ['Autonomía','Percentil 75',f'{df.autonomia_min.quantile(.75):.1f} min','Batería, motores y masa total'],
-        ['Seguridad','Necesidad del sistema','Validar','Retención de carga, redundancia y aterrizaje'],
-        ['Fabricación','Capacidad del escenario',f'{p["capacidad"]} unidades/mes','Proceso, tolerancias, ensamble y mantenimiento']
-    ],columns=['Requisito','Criterio docente','Objetivo preliminar','Decisión de diseño'])
-    st.dataframe(requisitos,hide_index=True)
-    st.markdown('''**Taller sugerido**
-1. Defina el problema, usuarios, variables y restricciones.
-2. Justifique el mercado objetivo y critique la extrapolación de la encuesta.
-3. Construya tres conceptos: multirrotor, ala fija y VTOL; compare carga, autonomía y costo.
-4. Proponga una matriz de decisión y un presupuesto de masa; no dimensione motores solo con la encuesta.
-5. Ajuste precio, capacidad e inversión para evaluar viabilidad; explique por qué rentabilidad no garantiza viabilidad técnica.
-6. Explique cuándo conviene rediseñar o retirar el producto y presente sus tablas de cuatro años.''')
-    with st.expander('Fórmulas y límites del modelo',expanded=True):
-        st.markdown('''Potencial = empresas objetivo × promedio(unidades × peso de intención × indicador de presupuesto ≥ precio).
+    st.markdown(f"""
+**Muestra.** {n} respuestas voluntarias de un formulario en línea. No es una muestra aleatoria: describe a quienes respondieron, no a toda la población de Quito.
 
-Peso: Sí = conversión; Tal vez = 0,3 × conversión; No = 0. Los pesos son supuestos editables en el código, no resultados estadísticos.
+**Preguntas sin respuesta.** Algunas personas dejaron preguntas en blanco. Cada porcentaje se calcula solo sobre quienes contestaron esa pregunta.
 
-Demanda mensual = potencial distribuido con curva lineal por tramos, redondeada por diferencias acumuladas. Ventas = mínimo(demanda, capacidad).
+**Preocupación.** Escala de 1 (ninguna) a 5 (mucha). «Alta» significa 4 o 5.
 
-Ingresos = ventas × precio. EBITDA = ingresos − costos variables − costos fijos. Utilidad operativa = EBITDA − depreciación lineal.
+**Casa de la calidad.** Importancia = 1 + 4 × (respaldo del requisito ÷ respaldo máximo). Los requisitos de función salen de una pregunta de selección múltiple implícita (ambas funciones suman a las dos) y los de preocupación de una pregunta de una sola opción, por eso las funciones pesan más; es una simplificación. Las relaciones 0/1/3/9 y las metas técnicas son criterio de diseño y se pueden editar.
 
-Inversión total en t=0; flujo operativo al final del mes. El CSV incluye inversión en la fila del mes 1 solo para sumar flujos. VAN = −inversión + suma(EBITDA mensual descontado). Recuperación simple sin descuento.
-
-Sin impuestos, deuda, capital de trabajo, valor residual, mantenimiento posterior a venta ni reinversión. No se calcula TIR. Activos depreciables son parte de la inversión y no se suman otra vez. Cuatro años es una hipótesis docente, no una vida útil demostrada. Los requisitos técnicos son objetivos preliminares, no un diseño validado.''')
+**Actualizar los datos.** Reemplaza `encuesta_respuestas.xlsx` en el repositorio, o sube un Excel nuevo desde el panel lateral para verlo sin guardarlo.
+""")
